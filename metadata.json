@@ -1,0 +1,6 @@
+{
+  "name": "VOLT 808 — Analog Drum Synthesizer & Sequencer",
+  "description": "A tactile vintage analog drum synthesizer and step sequencer featuring synthesized TR-808, Rack Kick, Spinz 808, Zay 808, and Hit 1 Hi-Hat engines, deep modulation, live preset swapping, and 24-bit stereo WAV, AIFF, FLAC, and MIDI export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

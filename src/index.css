@@ -1,0 +1,109 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Barlow Condensed", sans-serif;
+  --font-sans: "DM Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+}
+
+@layer base {
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: #110f0d;
+    color: #e8dfce;
+  }
+
+  /* Custom analog chassis scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #141210;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #3a342d;
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #52493f;
+  }
+}
+
+/* Tactile wood cheek grain for the vintage drum machine enclosure */
+.walnut-cheek {
+  background-color: #3b2314;
+  background-image:
+    repeating-linear-gradient(
+      90deg,
+      rgba(22, 11, 5, 0.28) 0px,
+      rgba(22, 11, 5, 0.28) 2px,
+      transparent 2px,
+      transparent 7px,
+      rgba(95, 56, 28, 0.22) 7px,
+      rgba(95, 56, 28, 0.22) 11px
+    ),
+    linear-gradient(180deg, #52321e 0%, #3d2415 45%, #2a170c 100%);
+  box-shadow:
+    inset 1px 0 0 rgba(255, 224, 185, 0.14),
+    inset -1px 0 0 rgba(0, 0, 0, 0.65);
+}
+
+/* Subtle brushed anodized faceplate surface */
+.anodized-panel {
+  background-color: #1f1c19;
+  background-image:
+    linear-gradient(180deg, rgba(255, 245, 230, 0.03) 0%, rgba(0, 0, 0, 0.12) 100%),
+    repeating-linear-gradient(
+      0deg,
+      rgba(255, 255, 255, 0.008) 0px,
+      rgba(255, 255, 255, 0.008) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+}
+
+/* Recessed instrument bay */
+.recessed-bay {
+  background-color: #151311;
+  box-shadow:
+    inset 0 2px 5px rgba(0, 0, 0, 0.65),
+    0 1px 0 rgba(232, 223, 206, 0.07);
+}
+
+/* VFD / CRT amber glass readout */
+.vfd-screen {
+  background: radial-gradient(ellipse at 50% 30%, #1c1810 0%, #0d0b08 75%, #080705 100%);
+  box-shadow:
+    inset 0 2px 10px rgba(0, 0, 0, 0.9),
+    inset 0 0 0 1px rgba(242, 169, 59, 0.14),
+    0 1px 0 rgba(232, 223, 206, 0.1);
+}
+
+/* Physical TR-808 style step keycap */
+.step-keycap {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.35),
+    0 2px 4px rgba(0, 0, 0, 0.55);
+  transition: transform 80ms cubic-bezier(0.16, 1, 0.3, 1), filter 120ms ease;
+}
+.step-keycap:active {
+  transform: translateY(1px);
+  box-shadow:
+    inset 0 2px 3px rgba(0, 0, 0, 0.45),
+    0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+/* Physical hardware push button */
+.hw-btn {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 248, 235, 0.12),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.45),
+    0 1px 2px rgba(0, 0, 0, 0.5);
+  transition: transform 80ms cubic-bezier(0.16, 1, 0.3, 1), background-color 120ms ease, color 120ms ease;
+}
+.hw-btn:active {
+  transform: translateY(1px);
+}
