@@ -28,6 +28,11 @@ import {
 } from './audio/sequencerMath';
 import { DrumAudioEngine, type EngineStateSnapshot } from './audio/audioEngine';
 import { loadUserPresets, saveUserPresets } from './audio/presetStorage';
+import {
+  decodeAndStoreSampleFile,
+  isLikelyAudioFile,
+  makeShortSampleTag,
+} from './audio/sampleStore';
 import { TransportBar } from './components/TransportBar';
 import { AnalogDisplay } from './components/AnalogDisplay';
 import { ChannelStripPanel } from './components/ChannelStripPanel';
@@ -67,6 +72,7 @@ export default function App() {
   const [exportModalOpen, setExportModalOpen] = useState<boolean>(false);
   const [swapMode, setSwapMode] = useState<'instant' | 'next-bar'>('instant');
   const [queuedPreset, setQueuedPreset] = useState<KitPreset | null>(null);
+  const [sampleError, setSampleError] = useState<string | null>(null);
 
   const tapTimesRef = useRef<number[]>([]);
   const hitClearTimerRef = useRef<number | null>(null);
@@ -256,16 +262,113 @@ export default function App() {
   };
 
   const handleChangeArchetype = (channelId: string, archetype: VoiceArchetype) => {
+    if (archetype === 'user-sample') return;
     const nextChannel = createChannelFromArchetype(channelId, archetype);
     setChannels((prev) =>
       prev.map((c) =>
         c.id === channelId
-          ? { ...nextChannel, mute: c.mute, solo: c.solo }
+          ? { ...nextChannel, mute: c.mute, solo: c.solo, customSample: undefined }
           : c
       )
     );
+    setSampleError(null);
     engineRef.current?.auditionChannel(nextChannel, 0.88);
   };
+
+  const handleLoadSampleFiles = useCallback(
+    async (targetChannelId: string, fileList: FileList | File[]) => {
+      const files = Array.from(fileList);
+      if (files.length === 0) return;
+
+      const startIdx = channels.findIndex((c) => c.id === targetChannelId);
+      if (startIdx < 0) return;
+
+      const errors: string[] = [];
+      const updates = new Map<
+        string,
+        {
+          meta: Awaited<ReturnType<typeof decodeAndStoreSampleFile>>;
+          shortName: string;
+        }
+      >();
+
+      for (let i = 0; i < files.length; i++) {
+        const slotIdx = startIdx + i;
+        if (slotIdx >= channels.length) break;
+        const file = files[i];
+        if (!isLikelyAudioFile(file)) {
+          errors.push(`"${file.name}" is not a supported audio format (use WAV, AIFF, FLAC, MP3, or OGG).`);
+          continue;
+        }
+        try {
+          const meta = await decodeAndStoreSampleFile(file);
+          updates.set(channels[slotIdx].id, {
+            meta,
+            shortName: makeShortSampleTag(meta.name),
+          });
+        } catch (err) {
+          errors.push(
+            err instanceof Error ? err.message : `Could not decode "${file.name}".`
+          );
+        }
+      }
+
+      if (updates.size > 0) {
+        const sampleDefaults = ARCHETYPES['user-sample'].defaultParams;
+        let firstLoadedChannel: DrumChannel | null = null;
+
+        setChannels((prev) =>
+          prev.map((c) => {
+            const loaded = updates.get(c.id);
+            if (!loaded) return c;
+            const nextCh: DrumChannel = {
+              ...c,
+              archetype: 'user-sample',
+              name: loaded.meta.name,
+              shortName: loaded.shortName,
+              customSample: loaded.meta,
+              params: {
+                ...sampleDefaults,
+                level: c.params.level,
+              },
+            };
+            if (!firstLoadedChannel && c.id === targetChannelId) {
+              firstLoadedChannel = nextCh;
+            }
+            return nextCh;
+          })
+        );
+
+        setSelectedChannelId(targetChannelId);
+        setRackTab('voice');
+        setSampleError(errors.length > 0 ? errors[0] : null);
+
+        // Audition the newly loaded target sample immediately
+        const targetUpdate = updates.get(targetChannelId);
+        if (targetUpdate) {
+          const existing = channels[startIdx];
+          const auditionCh: DrumChannel = {
+            ...existing,
+            archetype: 'user-sample',
+            name: targetUpdate.meta.name,
+            shortName: targetUpdate.shortName,
+            customSample: targetUpdate.meta,
+            params: {
+              ...sampleDefaults,
+              level: existing.params.level,
+            },
+          };
+          engineRef.current?.auditionChannel(auditionCh, 0.9);
+          setActiveHitIds([targetChannelId]);
+          if (hitClearTimerRef.current) window.clearTimeout(hitClearTimerRef.current);
+          hitClearTimerRef.current = window.setTimeout(() => setActiveHitIds([]), 120);
+        }
+      } else if (errors.length > 0) {
+        setSampleError(errors[0]);
+      }
+    },
+    [channels]
+  );
 
   const handleUpdateVoiceParam = <K extends keyof VoiceParams>(
     key: K,
@@ -507,6 +610,9 @@ export default function App() {
                 }}
                 onAuditionChannel={handleAuditionChannel}
                 onChangeArchetype={handleChangeArchetype}
+                onDropSamplesOnChannel={(chId, files) => {
+                  void handleLoadSampleFiles(chId, files);
+                }}
                 onToggleMute={handleToggleMute}
                 onToggleSolo={handleToggleSolo}
                 onChangeLevel={handleChangeLevel}
@@ -561,10 +667,15 @@ export default function App() {
                   {rackTab === 'voice' && (
                     <VoiceSynthEditor
                       channel={selectedChannel}
+                      sampleError={sampleError}
+                      onDismissSampleError={() => setSampleError(null)}
                       onUpdateParam={handleUpdateVoiceParam}
                       onChangeArchetype={(arch) =>
                         handleChangeArchetype(selectedChannel.id, arch)
                       }
+                      onLoadSampleFiles={(files) => {
+                        void handleLoadSampleFiles(selectedChannel.id, files);
+                      }}
                       onResetVoice={handleResetVoice}
                       onAudition={() => handleAuditionChannel(selectedChannel)}
                     />

@@ -2,13 +2,27 @@ import type { KitPreset } from '../types/drum';
 
 const STORAGE_KEY = 'volt808_user_presets_v1';
 
+function normalizePreset(preset: KitPreset): KitPreset {
+  return {
+    ...preset,
+    channels: preset.channels.map((ch) => ({
+      ...ch,
+      params: {
+        ...ch.params,
+        sustain: typeof ch.params.sustain === 'number' ? ch.params.sustain : 12,
+        release: typeof ch.params.release === 'number' ? ch.params.release : 45,
+      },
+    })),
+  };
+}
+
 export function loadUserPresets(): KitPreset[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isValidPreset);
+    return parsed.filter(isValidPreset).map(normalizePreset);
   } catch {
     return [];
   }

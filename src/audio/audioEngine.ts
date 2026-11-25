@@ -338,7 +338,8 @@ export class DrumAudioEngine {
       params,
       velocity,
       when,
-      targets
+      targets,
+      channel.customSample?.id
     );
     if (params.chokeGroup > 0) {
       map.set(params.chokeGroup, handle);
@@ -544,7 +545,8 @@ export async function renderPatternOfflineStereo(params: {
           modParams,
           vel,
           hitTime,
-          targets
+          targets,
+          ch.customSample?.id
         );
         if (modParams.chokeGroup > 0) {
           chokeMap.set(modParams.chokeGroup, handle);

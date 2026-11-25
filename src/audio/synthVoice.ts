@@ -1,6 +1,12 @@
 import type { VoiceArchetype, VoiceParams } from '../types/drum';
 import { ARCHETYPES } from './presets';
 import { clamp } from './sequencerMath';
+import {
+  applyAdsrToGain,
+  buildZeroDcSaturationCurve,
+  computeAdsrSchedule,
+} from './envelopeMath';
+import { getSampleBufferForContext } from './sampleStore';
 
 export interface VoiceBusTargets {
   dryBus: AudioNode;
@@ -32,22 +38,15 @@ function getWhiteNoiseBuffer(ctx: BaseAudioContext): AudioBuffer {
 }
 
 /**
- * Generates an asymmetric analog tape/transistor saturation waveshaper curve.
+ * Generates a strictly DC-centered asymmetric analog saturation curve.
+ * curve(0) === 0.0 eliminates DC step pops when voices start, decay, or stop.
  */
 export function getSaturationCurve(driveAmount: number): Float32Array<ArrayBuffer> {
   const key = Math.round(clamp(driveAmount, 0, 100)).toString();
   const cached = curveCache.get(key);
   if (cached) return cached;
 
-  const samples = 2048;
-  const curve = new Float32Array(new ArrayBuffer(samples * 4));
-  const k = 1 + (clamp(driveAmount, 0, 100) / 100) * 14;
-  for (let i = 0; i < samples; i++) {
-    const x = (i * 2) / samples - 1;
-    // Slight even-order harmonic asymmetry for warm vintage analog character
-    const shifted = x + 0.06 * (k / 15);
-    curve[i] = Math.tanh(shifted * k) / Math.tanh(k);
-  }
+  const curve = buildZeroDcSaturationCurve(driveAmount);
   curveCache.set(key, curve);
   return curve;
 }
@@ -57,8 +56,8 @@ function semitoneRatio(semitones: number): number {
 }
 
 /**
- * Synthesizes and triggers one drum hit on either a live AudioContext or OfflineAudioContext.
- * Returns a choke handle so open hats or 808 glides can be cleanly muted by choke groups.
+ * Synthesizes and triggers one drum hit or user sample on either a live AudioContext
+ * or OfflineAudioContext, shaped through a click-free post-drive ADSR VCA.
  */
 export function triggerSynthesizedVoice(
   ctx: BaseAudioContext,
@@ -66,19 +65,41 @@ export function triggerSynthesizedVoice(
   params: VoiceParams,
   velocity: number,
   when: number,
-  targets: VoiceBusTargets
+  targets: VoiceBusTargets,
+  customSampleId?: string
 ): ActiveVoiceHandle {
   const t = Math.max(ctx.currentTime, when);
   const meta = ARCHETYPES[archetype];
   const pitchRatio = semitoneRatio(params.tune);
   const vel = clamp(velocity, 0.05, 1.15);
-  const attackSec = Math.max(0.0008, params.attack / 1000);
-  const decaySec = clamp(params.decay / 1000, 0.02, 2.5);
+  const decaySec = clamp(params.decay / 1000, 0.015, 2.5);
   const pitchDecaySec = clamp(params.pitchDecay / 1000, 0.005, 0.35);
   const toneNorm = clamp(params.tone / 100, 0, 1);
   const snapNorm = clamp(params.snap / 100, 0, 1);
 
-  // Per-voice output chain: VoiceSum -> Filter -> Drive -> ChokeGain -> Level -> StereoPanner -> Sends
+  let sampleBuffer: AudioBuffer | null = null;
+  let samplePlaybackRate = clamp(pitchRatio, 0.25, 4.0);
+  let sampleScaledDur: number | undefined;
+
+  if (archetype === 'user-sample') {
+    sampleBuffer = customSampleId ? getSampleBufferForContext(ctx, customSampleId) : null;
+    if (!sampleBuffer) {
+      return { choke() {} };
+    }
+    sampleScaledDur = sampleBuffer.duration / samplePlaybackRate;
+  }
+
+  const schedule = computeAdsrSchedule({
+    startTime: t,
+    attackMs: params.attack,
+    decayMs: params.decay,
+    sustainPercent: params.sustain,
+    releaseMs: params.release,
+    sampleDurationSec: sampleScaledDur,
+  });
+
+  // Per-voice output chain:
+  // VoiceSum -> Filter -> Drive (DC-free) -> ADSR VCA (exact 0.0 tail) -> ChokeGain -> Level -> StereoPanner -> Sends
   const voiceSum = ctx.createGain();
   voiceSum.gain.value = 1;
 
@@ -91,6 +112,9 @@ export function triggerSynthesizedVoice(
   shaper.oversample = '2x';
   shaper.curve = getSaturationCurve(params.drive);
 
+  const adsrGain = ctx.createGain();
+  applyAdsrToGain(adsrGain.gain, schedule, 1.0);
+
   const chokeGain = ctx.createGain();
   chokeGain.gain.setValueAtTime(1, t);
 
@@ -102,7 +126,8 @@ export function triggerSynthesizedVoice(
 
   voiceSum.connect(filter);
   filter.connect(shaper);
-  shaper.connect(chokeGain);
+  shaper.connect(adsrGain);
+  adsrGain.connect(chokeGain);
   chokeGain.connect(levelGain);
   levelGain.connect(panner);
 
@@ -121,10 +146,36 @@ export function triggerSynthesizedVoice(
     dlyGain.connect(targets.delaySend);
   }
 
-  const stopAt = t + decaySec + 0.12;
+  const stopAt = schedule.stopTime;
   const noiseBuf = getWhiteNoiseBuffer(ctx);
 
   switch (archetype) {
+    case 'user-sample': {
+      if (sampleBuffer) {
+        const src = ctx.createBufferSource();
+        src.buffer = sampleBuffer;
+        if (params.pitchEnv > 1) {
+          const startRate = clamp(
+            samplePlaybackRate * (1 + (params.pitchEnv / 100) * 1.6),
+            0.25,
+            6.0
+          );
+          src.playbackRate.setValueAtTime(startRate, t);
+          src.playbackRate.exponentialRampToValueAtTime(samplePlaybackRate, t + pitchDecaySec);
+        } else {
+          src.playbackRate.setValueAtTime(samplePlaybackRate, t);
+        }
+        src.connect(voiceSum);
+        src.start(t);
+        const safeSampleStop =
+          sampleScaledDur !== undefined
+            ? Math.min(t + sampleScaledDur + 0.015, stopAt)
+            : stopAt;
+        src.stop(safeSampleStop);
+      }
+      break;
+    }
+
     case 'rack-kick': {
       // Punchy hip-hop/trap Rack Kick: dual-stage pitch sweep + warm knock body + sharp transient click
       const baseF = meta.baseFreq * pitchRatio;
@@ -137,25 +188,25 @@ export function triggerSynthesizedVoice(
       osc.frequency.exponentialRampToValueAtTime(Math.max(24, midF), t + pitchDecaySec * 0.42);
       osc.frequency.exponentialRampToValueAtTime(Math.max(22, baseF), t + pitchDecaySec);
 
+      const bodyGain = ctx.createGain();
+      bodyGain.gain.setValueAtTime(1.02, t);
+
       // Subtle triangle layer for punchy mid-low knock
       const knockOsc = ctx.createOscillator();
       knockOsc.type = 'triangle';
       knockOsc.frequency.setValueAtTime(startF * 1.15, t);
       knockOsc.frequency.exponentialRampToValueAtTime(Math.max(30, baseF * 1.1), t + pitchDecaySec * 0.6);
 
+      const knockEnd = t + Math.min(decaySec, 0.14);
       const knockGain = ctx.createGain();
       knockGain.gain.setValueAtTime(0.32 * toneNorm, t);
-      knockGain.gain.exponentialRampToValueAtTime(0.001, t + Math.min(decaySec, 0.14));
+      knockGain.gain.exponentialRampToValueAtTime(0.002, knockEnd * 0.9 + t * 0.1);
+      knockGain.gain.linearRampToValueAtTime(0, knockEnd);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(1.05, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-
-      osc.connect(amp);
+      osc.connect(bodyGain);
       knockOsc.connect(knockGain);
-      knockGain.connect(amp);
-      amp.connect(voiceSum);
+      knockGain.connect(bodyGain);
+      bodyGain.connect(voiceSum);
 
       // Crisp beater/rack click transient
       if (snapNorm > 0.02) {
@@ -167,7 +218,8 @@ export function triggerSynthesizedVoice(
         clickBp.Q.setValueAtTime(1.5, t);
         const clickAmp = ctx.createGain();
         clickAmp.gain.setValueAtTime(0.65 * snapNorm, t);
-        clickAmp.gain.exponentialRampToValueAtTime(0.0008, t + 0.016);
+        clickAmp.gain.exponentialRampToValueAtTime(0.002, t + 0.013);
+        clickAmp.gain.linearRampToValueAtTime(0, t + 0.018);
         clickSrc.connect(clickBp);
         clickBp.connect(clickAmp);
         clickAmp.connect(voiceSum);
@@ -183,7 +235,7 @@ export function triggerSynthesizedVoice(
     }
 
     case 'spinz-808': {
-      // Iconic Spinz 808: warm sub fundamental + 2nd/3rd harmonic richness + resonant 125Hz warmth + long smooth decay
+      // Iconic Spinz 808: warm sub fundamental + 2nd/3rd harmonic richness + resonant 120Hz warmth
       const baseF = meta.baseFreq * pitchRatio;
       const startF = baseF * (1 + (params.pitchEnv / 100) * 3.1);
 
@@ -200,7 +252,7 @@ export function triggerSynthesizedVoice(
 
       const harmGain = ctx.createGain();
       harmGain.gain.setValueAtTime(0.22 * toneNorm, t);
-      harmGain.gain.exponentialRampToValueAtTime(0.02 * toneNorm + 0.001, t + decaySec * 0.75);
+      harmGain.gain.exponentialRampToValueAtTime(Math.max(0.005, 0.05 * toneNorm), t + decaySec * 0.75);
 
       const bodyEq = ctx.createBiquadFilter();
       bodyEq.type = 'peaking';
@@ -208,16 +260,10 @@ export function triggerSynthesizedVoice(
       bodyEq.Q.setValueAtTime(1.8, t);
       bodyEq.gain.setValueAtTime(4.5 * toneNorm, t);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(1.0, t + attackSec);
-      amp.gain.setTargetAtTime(0.0008, t + attackSec + 0.02, decaySec * 0.34);
-
       subOsc.connect(bodyEq);
       harmOsc.connect(harmGain);
       harmGain.connect(bodyEq);
-      bodyEq.connect(amp);
-      amp.connect(voiceSum);
+      bodyEq.connect(voiceSum);
 
       // Subtle punchy thump transient
       if (snapNorm > 0.02) {
@@ -227,17 +273,18 @@ export function triggerSynthesizedVoice(
         thump.frequency.exponentialRampToValueAtTime(55, t + 0.018);
         const thumpGain = ctx.createGain();
         thumpGain.gain.setValueAtTime(0.45 * snapNorm, t);
-        thumpGain.gain.exponentialRampToValueAtTime(0.0008, t + 0.024);
+        thumpGain.gain.exponentialRampToValueAtTime(0.002, t + 0.02);
+        thumpGain.gain.linearRampToValueAtTime(0, t + 0.026);
         thump.connect(thumpGain);
         thumpGain.connect(voiceSum);
         thump.start(t);
-        thump.stop(t + 0.032);
+        thump.stop(t + 0.036);
       }
 
       subOsc.start(t);
       harmOsc.start(t);
-      subOsc.stop(stopAt + 0.3);
-      harmOsc.stop(stopAt + 0.3);
+      subOsc.stop(stopAt);
+      harmOsc.stop(stopAt);
       break;
     }
 
@@ -261,22 +308,16 @@ export function triggerSynthesizedVoice(
       gritFilter.frequency.setValueAtTime(340 + toneNorm * 620, t);
       const gritGain = ctx.createGain();
       gritGain.gain.setValueAtTime(0.28 * toneNorm, t);
-      gritGain.gain.exponentialRampToValueAtTime(0.001, t + decaySec * 0.7);
+      gritGain.gain.exponentialRampToValueAtTime(Math.max(0.005, 0.04 * toneNorm), t + decaySec * 0.7);
 
       const preClip = ctx.createWaveShaper();
       preClip.curve = getSaturationCurve(45 + toneNorm * 35);
-
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(1.06, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
 
       osc.connect(preClip);
       gritOsc.connect(gritFilter);
       gritFilter.connect(gritGain);
       gritGain.connect(preClip);
-      preClip.connect(amp);
-      amp.connect(voiceSum);
+      preClip.connect(voiceSum);
 
       if (snapNorm > 0.02) {
         const snapSrc = ctx.createBufferSource();
@@ -287,12 +328,13 @@ export function triggerSynthesizedVoice(
         snapBp.Q.setValueAtTime(1.2, t);
         const snapGain = ctx.createGain();
         snapGain.gain.setValueAtTime(0.5 * snapNorm, t);
-        snapGain.gain.exponentialRampToValueAtTime(0.0008, t + 0.015);
+        snapGain.gain.exponentialRampToValueAtTime(0.002, t + 0.013);
+        snapGain.gain.linearRampToValueAtTime(0, t + 0.018);
         snapSrc.connect(snapBp);
         snapBp.connect(snapGain);
         snapGain.connect(voiceSum);
         snapSrc.start(t);
-        snapSrc.stop(t + 0.025);
+        snapSrc.stop(t + 0.028);
       }
 
       osc.start(t);
@@ -312,13 +354,7 @@ export function triggerSynthesizedVoice(
       osc.frequency.setValueAtTime(startF, t);
       osc.frequency.exponentialRampToValueAtTime(Math.max(24, baseF), t + pitchDecaySec);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(1.05, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-
-      osc.connect(amp);
-      amp.connect(voiceSum);
+      osc.connect(voiceSum);
 
       // Authentic TR-808 trigger impulse pulse
       if (snapNorm > 0.02) {
@@ -328,11 +364,12 @@ export function triggerSynthesizedVoice(
         pulse.frequency.exponentialRampToValueAtTime(75, t + 0.01);
         const pGain = ctx.createGain();
         pGain.gain.setValueAtTime(0.55 * snapNorm, t);
-        pGain.gain.exponentialRampToValueAtTime(0.0008, t + 0.014);
+        pGain.gain.exponentialRampToValueAtTime(0.002, t + 0.012);
+        pGain.gain.linearRampToValueAtTime(0, t + 0.016);
         pulse.connect(pGain);
         pGain.connect(voiceSum);
         pulse.start(t);
-        pulse.stop(t + 0.02);
+        pulse.stop(t + 0.026);
       }
 
       osc.start(t);
@@ -355,24 +392,25 @@ export function triggerSynthesizedVoice(
       osc2.frequency.setValueAtTime(f2 * (1 + (params.pitchEnv / 100) * 0.5), t);
       osc2.frequency.exponentialRampToValueAtTime(f2, t + pitchDecaySec);
 
+      const bodyPeak = 0.78 * (0.4 + 0.6 * (1 - toneNorm * 0.4));
+      const bodyFloor = Math.max(0.06, 0.42 * (1 - snapNorm));
       const bodyAmp = ctx.createGain();
-      bodyAmp.gain.setValueAtTime(0.78 * (0.4 + 0.6 * (1 - toneNorm * 0.4)), t);
-      bodyAmp.gain.exponentialRampToValueAtTime(0.0008, t + Math.min(decaySec, 0.24));
+      bodyAmp.gain.setValueAtTime(bodyPeak, t);
+      bodyAmp.gain.exponentialRampToValueAtTime(bodyFloor, t + Math.min(decaySec, 0.22));
 
       osc1.connect(bodyAmp);
       osc2.connect(bodyAmp);
       bodyAmp.connect(voiceSum);
 
-      // Snappy white noise wire
+      // Snappy white noise wire (looped so long ADSR tails never run dry)
       const noiseSrc = ctx.createBufferSource();
       noiseSrc.buffer = noiseBuf;
+      noiseSrc.loop = true;
       const noiseHp = ctx.createBiquadFilter();
       noiseHp.type = 'highpass';
       noiseHp.frequency.setValueAtTime(1400 + toneNorm * 1400, t);
       const noiseAmp = ctx.createGain();
-      noiseAmp.gain.setValueAtTime(0.0001, t);
-      noiseAmp.gain.linearRampToValueAtTime(0.95 * snapNorm, t + attackSec);
-      noiseAmp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
+      noiseAmp.gain.setValueAtTime(0.95 * snapNorm, t);
 
       noiseSrc.connect(noiseHp);
       noiseHp.connect(noiseAmp);
@@ -388,33 +426,33 @@ export function triggerSynthesizedVoice(
     }
 
     case 'tr808-cp': {
-      // Authentic TR-808 Hand Clap: 3 micro-bursts separated by ~10ms + decaying reverb tail through 1.2kHz bandpass
+      // Authentic TR-808 Hand Clap: 3 micro-bursts separated by ~10ms + sustained noise tail shaped by ADSR
       const noiseSrc = ctx.createBufferSource();
       noiseSrc.buffer = noiseBuf;
+      noiseSrc.loop = true;
 
       const bp = ctx.createBiquadFilter();
       bp.type = 'bandpass';
       bp.frequency.setValueAtTime(1180 * pitchRatio, t);
       bp.Q.setValueAtTime(2.1 + toneNorm * 1.4, t);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
+      const clapShape = ctx.createGain();
+      clapShape.gain.setValueAtTime(0.95, t);
 
-      // 3 iconic staggered clap bursts (0ms, 11ms, 22ms) + main tail at 32ms
+      // 3 iconic staggered clap bursts (0ms, 11ms, 22ms) + steady tail into master ADSR
       const bursts = [0, 0.011, 0.022];
       for (const offset of bursts) {
-        amp.gain.setValueAtTime(0.95, t + offset);
-        amp.gain.exponentialRampToValueAtTime(0.16, t + offset + 0.009);
+        clapShape.gain.setValueAtTime(0.95, t + offset);
+        clapShape.gain.exponentialRampToValueAtTime(0.18, t + offset + 0.009);
       }
-      amp.gain.setValueAtTime(0.92 * (0.45 + 0.55 * snapNorm), t + 0.032);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + 0.032 + decaySec);
+      clapShape.gain.setValueAtTime(0.92 * (0.45 + 0.55 * snapNorm), t + 0.032);
 
       noiseSrc.connect(bp);
-      bp.connect(amp);
-      amp.connect(voiceSum);
+      bp.connect(clapShape);
+      clapShape.connect(voiceSum);
 
       noiseSrc.start(t);
-      noiseSrc.stop(stopAt + 0.05);
+      noiseSrc.stop(stopAt);
       break;
     }
 
@@ -423,7 +461,6 @@ export function triggerSynthesizedVoice(
     case 'tr808-oh':
     case 'tr808-cy': {
       // Classic 6-oscillator Schmitt-trigger metallic square cluster + crisp noise air
-      // Authentic TR-808 ratios: 205.3, 304.4, 369.6, 522.7, 540.0, 800.0 Hz (scaled up slightly for Hit 1 Hat)
       const isHit1 = archetype === 'hit1-hat';
       const isCymbal = archetype === 'tr808-cy';
       const freqs = isHit1
@@ -433,7 +470,6 @@ export function triggerSynthesizedVoice(
       const metalBus = ctx.createGain();
       metalBus.gain.value = isHit1 ? 0.34 : 0.42;
 
-      const oscs: OscillatorNode[] = [];
       for (const f of freqs) {
         const o = ctx.createOscillator();
         o.type = 'square';
@@ -441,7 +477,6 @@ export function triggerSynthesizedVoice(
         o.connect(metalBus);
         o.start(t);
         o.stop(stopAt);
-        oscs.push(o);
       }
 
       const metalBp = ctx.createBiquadFilter();
@@ -453,43 +488,34 @@ export function triggerSynthesizedVoice(
       metalHp.type = 'highpass';
       metalHp.frequency.setValueAtTime(isHit1 ? 7400 : 5400, t);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(1.0, t + attackSec);
-      if (isCymbal) {
-        amp.gain.exponentialRampToValueAtTime(0.32, t + decaySec * 0.25);
-        amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-      } else {
-        amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-      }
-
       metalBus.connect(metalBp);
       metalBp.connect(metalHp);
-      metalHp.connect(amp);
+      metalHp.connect(voiceSum);
 
       // Crisp high-frequency air/click transient (crucial for Hit 1 Hi-Hat bite)
       if (snapNorm > 0.05) {
         const nSrc = ctx.createBufferSource();
         nSrc.buffer = noiseBuf;
+        nSrc.loop = true;
         const nHp = ctx.createBiquadFilter();
         nHp.type = 'highpass';
         nHp.frequency.setValueAtTime(isHit1 ? 9200 : 7600, t);
+        const airDur = Math.min(decaySec, isHit1 ? 0.045 : 0.08);
         const nGain = ctx.createGain();
         nGain.gain.setValueAtTime((isHit1 ? 0.72 : 0.42) * snapNorm, t);
-        nGain.gain.exponentialRampToValueAtTime(0.0008, t + Math.min(decaySec, isHit1 ? 0.045 : 0.08));
+        nGain.gain.exponentialRampToValueAtTime(0.004, t + airDur * 0.85);
+        nGain.gain.linearRampToValueAtTime(0, t + airDur);
         nSrc.connect(nHp);
         nHp.connect(nGain);
-        nGain.connect(amp);
+        nGain.connect(voiceSum);
         nSrc.start(t);
         nSrc.stop(stopAt);
       }
-
-      amp.connect(voiceSum);
       break;
     }
 
     case 'tr808-cb': {
-      // Iconic TR-808 Cowbell: 540Hz + 800Hz square oscillators through resonant bandpass + dual-stage decay
+      // Iconic TR-808 Cowbell: 540Hz + 800Hz square oscillators through resonant bandpass + accent contour
       const o1 = ctx.createOscillator();
       o1.type = 'square';
       o1.frequency.setValueAtTime(540 * pitchRatio, t);
@@ -503,16 +529,14 @@ export function triggerSynthesizedVoice(
       bp.frequency.setValueAtTime(880 * pitchRatio, t);
       bp.Q.setValueAtTime(2.6 + toneNorm * 1.4, t);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(0.9, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.28, t + Math.min(0.05, decaySec * 0.2));
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
+      const cbContour = ctx.createGain();
+      cbContour.gain.setValueAtTime(0.95, t);
+      cbContour.gain.exponentialRampToValueAtTime(0.52, t + Math.min(0.048, decaySec * 0.2));
 
       o1.connect(bp);
       o2.connect(bp);
-      bp.connect(amp);
-      amp.connect(voiceSum);
+      bp.connect(cbContour);
+      cbContour.connect(voiceSum);
 
       o1.start(t);
       o2.start(t);
@@ -538,19 +562,15 @@ export function triggerSynthesizedVoice(
       overOsc.frequency.setValueAtTime(startF * 1.5, t);
       overOsc.frequency.exponentialRampToValueAtTime(Math.max(60, baseF * 1.5), t + pitchDecaySec);
 
+      const overDur = Math.max(0.02, decaySec * 0.4);
       const overGain = ctx.createGain();
       overGain.gain.setValueAtTime(0.22 * toneNorm, t);
-      overGain.gain.exponentialRampToValueAtTime(0.001, t + decaySec * 0.4);
+      overGain.gain.exponentialRampToValueAtTime(0.002, t + overDur * 0.85);
+      overGain.gain.linearRampToValueAtTime(0, t + overDur);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(0.95, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-
-      osc.connect(amp);
+      osc.connect(voiceSum);
       overOsc.connect(overGain);
-      overGain.connect(amp);
-      amp.connect(voiceSum);
+      overGain.connect(voiceSum);
 
       if (snapNorm > 0.04) {
         const stickSrc = ctx.createBufferSource();
@@ -560,12 +580,13 @@ export function triggerSynthesizedVoice(
         stickBp.frequency.setValueAtTime(1800, t);
         const stickAmp = ctx.createGain();
         stickAmp.gain.setValueAtTime(0.32 * snapNorm, t);
-        stickAmp.gain.exponentialRampToValueAtTime(0.0008, t + 0.012);
+        stickAmp.gain.exponentialRampToValueAtTime(0.002, t + 0.01);
+        stickAmp.gain.linearRampToValueAtTime(0, t + 0.014);
         stickSrc.connect(stickBp);
         stickBp.connect(stickAmp);
         stickAmp.connect(voiceSum);
         stickSrc.start(t);
-        stickSrc.stop(t + 0.02);
+        stickSrc.stop(t + 0.024);
       }
 
       osc.start(t);
@@ -576,7 +597,7 @@ export function triggerSynthesizedVoice(
     }
 
     case 'tr808-rs': {
-      // TR-808 Rimshot: dual woody resonant triangle/pulse oscillators + short bark burst
+      // TR-808 Rimshot: dual woody resonant triangle/pulse oscillators
       const f1 = 460 * pitchRatio;
       const f2 = 1660 * pitchRatio;
 
@@ -591,17 +612,12 @@ export function triggerSynthesizedVoice(
 
       const o2Gain = ctx.createGain();
       o2Gain.gain.setValueAtTime(0.42 * toneNorm, t);
-      o2Gain.gain.exponentialRampToValueAtTime(0.001, t + 0.022);
+      o2Gain.gain.exponentialRampToValueAtTime(0.002, t + 0.02);
+      o2Gain.gain.linearRampToValueAtTime(0, t + 0.026);
 
-      const amp = ctx.createGain();
-      amp.gain.setValueAtTime(0.0001, t);
-      amp.gain.linearRampToValueAtTime(0.95, t + attackSec);
-      amp.gain.exponentialRampToValueAtTime(0.0008, t + decaySec);
-
-      o1.connect(amp);
+      o1.connect(voiceSum);
       o2.connect(o2Gain);
-      o2Gain.connect(amp);
-      amp.connect(voiceSum);
+      o2Gain.connect(voiceSum);
 
       o1.start(t);
       o2.start(t);
@@ -616,7 +632,7 @@ export function triggerSynthesizedVoice(
       const ct = Math.max(ctx.currentTime, atTime);
       chokeGain.gain.cancelScheduledValues(ct);
       chokeGain.gain.setValueAtTime(chokeGain.gain.value, ct);
-      chokeGain.gain.exponentialRampToValueAtTime(0.0001, ct + 0.008);
+      chokeGain.gain.linearRampToValueAtTime(0, ct + 0.012);
     },
   };
 }

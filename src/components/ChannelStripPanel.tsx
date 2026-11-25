@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import type { DrumChannel, VoiceArchetype } from '../types/drum';
 import { ARCHETYPE_LIST } from '../audio/presets';
 
@@ -9,6 +9,7 @@ interface ChannelStripPanelProps {
   onSelectChannel: (id: string) => void;
   onAuditionChannel: (channel: DrumChannel) => void;
   onChangeArchetype: (channelId: string, archetype: VoiceArchetype) => void;
+  onDropSamplesOnChannel: (channelId: string, files: FileList | File[]) => void;
   onToggleMute: (channelId: string) => void;
   onToggleSolo: (channelId: string) => void;
   onChangeLevel: (channelId: string, level: number) => void;
@@ -24,11 +25,13 @@ export const ChannelStripPanel: React.FC<ChannelStripPanelProps> = ({
   onSelectChannel,
   onAuditionChannel,
   onChangeArchetype,
+  onDropSamplesOnChannel,
   onToggleMute,
   onToggleSolo,
   onChangeLevel,
 }) => {
   const hitSet = new Set(activeHitIds);
+  const [dragOverChannelId, setDragOverChannelId] = useState<string | null>(null);
 
   return (
     <section
@@ -42,19 +45,45 @@ export const ChannelStripPanel: React.FC<ChannelStripPanelProps> = ({
         >
           8-CHANNEL ANALOG MIXER &amp; VOICE RACK
         </h2>
-        <span className="font-mono text-[10px] text-[#8F8473]">PAD · ENGINE · MIX</span>
+        <span className="font-mono text-[10px] text-[#8F8473]">DROP AUDIO · PAD · MIX</span>
       </div>
 
       <div className="flex flex-col gap-1">
         {channels.map((ch, idx) => {
           const isSelected = ch.id === selectedChannelId;
           const isHit = hitSet.has(ch.id);
+          const isDropTarget = dragOverChannelId === ch.id;
 
           return (
             <div
               key={ch.id}
+              data-channel-dropzone={ch.id}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (dragOverChannelId !== ch.id) {
+                  setDragOverChannelId(ch.id);
+                }
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                const related = e.relatedTarget as Node | null;
+                if (!related || !e.currentTarget.contains(related)) {
+                  setDragOverChannelId((prev) => (prev === ch.id ? null : prev));
+                }
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setDragOverChannelId(null);
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                  onDropSamplesOnChannel(ch.id, e.dataTransfer.files);
+                }
+              }}
               className={`grid grid-cols-[56px_1fr_auto_64px] items-center gap-1.5 px-1.5 py-0.5 rounded-[3px] border transition-colors ${
-                isSelected
+                isDropTarget
+                  ? 'bg-[#362917] border-[#F0C14B] shadow-[inset_0_0_0_1px_rgba(240,193,75,0.45)]'
+                  : isSelected
                   ? 'bg-[#28231D] border-[#E27A27]/70'
                   : 'bg-[#1B1815] border-[#2A2520] hover:border-[#3D362E]'
               }`}
@@ -73,12 +102,12 @@ export const ChannelStripPanel: React.FC<ChannelStripPanelProps> = ({
                     : 'bg-[#24201C] border-[#38312A] text-[#D8CEBC] hover:bg-[#2D2823]'
                 }`}
               >
-                <span className="font-mono text-[11px] font-semibold tracking-tight">
+                <span className="font-mono text-[11px] font-semibold tracking-tight truncate">
                   {ch.shortName}
                 </span>
                 <span
                   aria-hidden="true"
-                  className={`w-2 h-2 rounded-full border border-black/60 transition-colors duration-75 ${
+                  className={`w-2 h-2 shrink-0 rounded-full border border-black/60 transition-colors duration-75 ${
                     isHit
                       ? 'bg-[#FF6E3A] shadow-[0_0_6px_#FF6E3A]'
                       : isSelected
@@ -88,31 +117,44 @@ export const ChannelStripPanel: React.FC<ChannelStripPanelProps> = ({
                 />
               </button>
 
-              {/* Voice Archetype Swapper */}
-              <select
-                aria-label={`Voice engine for channel ${idx + 1}`}
-                value={ch.archetype}
-                onChange={(e) => {
-                  onSelectChannel(ch.id);
-                  onChangeArchetype(ch.id, e.target.value as VoiceArchetype);
-                }}
-                className="w-full min-w-0 bg-[#141210] text-[#E8DFCE] text-xs font-medium px-2 py-1 rounded-[2px] border border-[#332D26] focus:outline-none focus:border-[#E27A27] cursor-pointer truncate"
-              >
-                <optgroup label="Mainstream Synthesized">
-                  {MAINSTREAM_ARCHETYPES.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name}
-                    </option>
-                  ))}
-                </optgroup>
-                <optgroup label="Roland TR-808 Kit">
-                  {TR808_ARCHETYPES.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name}
-                    </option>
-                  ))}
-                </optgroup>
-              </select>
+              {/* Voice Archetype Swapper or Drop Indicator */}
+              {isDropTarget ? (
+                <div className="w-full min-w-0 bg-[#1F180E] text-[#F4C54C] text-xs font-mono font-semibold px-2 py-1 rounded-[2px] border border-[#E0B034]/70 truncate">
+                  Drop sample → CH {idx + 1}
+                </div>
+              ) : (
+                <select
+                  aria-label={`Voice engine for channel ${idx + 1}`}
+                  value={ch.archetype}
+                  onChange={(e) => {
+                    onSelectChannel(ch.id);
+                    onChangeArchetype(ch.id, e.target.value as VoiceArchetype);
+                  }}
+                  className="w-full min-w-0 bg-[#141210] text-[#E8DFCE] text-xs font-medium px-2 py-1 rounded-[2px] border border-[#332D26] focus:outline-none focus:border-[#E27A27] cursor-pointer truncate"
+                >
+                  {ch.archetype === 'user-sample' && ch.customSample && (
+                    <optgroup label="User Sample">
+                      <option value="user-sample">
+                        Sample: {ch.customSample.name}
+                      </option>
+                    </optgroup>
+                  )}
+                  <optgroup label="Mainstream Synthesized">
+                    {MAINSTREAM_ARCHETYPES.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Roland TR-808 Kit">
+                    {TR808_ARCHETYPES.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
+              )}
 
               {/* Mute & Solo Hardware Buttons */}
               <div className="flex items-center gap-1">

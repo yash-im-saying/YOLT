@@ -13,16 +13,28 @@ export type VoiceArchetype =
   | 'tr808-mt'
   | 'tr808-ht'
   | 'tr808-rs'
-  | 'tr808-cy';
+  | 'tr808-cy'
+  | 'user-sample';
 
 export type FilterMode = 'lowpass' | 'highpass' | 'bandpass';
+
+export interface CustomSampleMeta {
+  id: string;
+  name: string;
+  durationSec: number;
+  sampleRate: number;
+  channels: number;
+  peaks: number[];
+}
 
 export interface VoiceParams {
   tune: number;          // -24 to +24 semitones relative to archetype base pitch
   pitchEnv: number;      // 0 to 100 % pitch sweep depth
   pitchDecay: number;    // 5 to 300 ms
-  attack: number;        // 0 to 50 ms
-  decay: number;         // 20 to 2200 ms
+  attack: number;        // 0 to 250 ms (ADSR A)
+  decay: number;         // 15 to 2200 ms (ADSR D)
+  sustain: number;       // 0 to 100 % (ADSR S)
+  release: number;       // 8 to 2000 ms (ADSR R)
   tone: number;          // 0 to 100 % body/harmonic tone
   snap: number;          // 0 to 100 % click/noise/snappy mix
   filterMode: FilterMode;
@@ -55,6 +67,7 @@ export interface DrumChannel {
   mute: boolean;
   solo: boolean;
   params: VoiceParams;
+  customSample?: CustomSampleMeta;
 }
 
 export type LfoShape = 'sine' | 'triangle' | 'sawtooth' | 'sampleHold';
@@ -123,7 +136,7 @@ export interface ArchetypeMeta {
   id: VoiceArchetype;
   name: string;
   shortName: string;
-  category: 'Mainstream' | 'TR-808 Kit';
+  category: 'Mainstream' | 'TR-808 Kit' | 'User Sample';
   midiNote: number;
   baseFreq: number;
   description: string;
